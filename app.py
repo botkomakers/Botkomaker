@@ -1,104 +1,94 @@
+import re
 import os
-import aiohttp
-import yt_dlp
+import asyncio
 from pyrogram import Client, filters
-from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
+from pyrogram.types import Message
+from yt_dlp import YoutubeDL
+from config import temp
+from plugins.utils import progress_bar, humanbytes
 
-API_ID = int(os.getenv("API_ID", 123456))
-API_HASH = os.getenv("API_HASH", "your_api_hash")
-BOT_TOKEN = os.getenv("BOT_TOKEN", "your_bot_token")
+# Supported platform regex patterns
+LINK_PATTERNS = {
+    "youtube": r"(https?://)?(www\.)?(youtube\.com|youtu\.be)/\S+",
+    "facebook": r"(https?://)?(www\.)?facebook\.com/\S+",
+    "tiktok": r"(https?://)?(www\.)?tiktok\.com/\S+",
+    "instagram": r"(https?://)?(www\.)?instagram\.com/\S+",
+    "twitter": r"(https?://)?(www\.)?(x\.com|twitter\.com)/\S+"
+}
 
-app = Client("smart_downloader_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
+# Output template
+YDL_OPTS = {
+    "format": "bestvideo+bestaudio/best",
+    "outtmpl": "downloads/%(title).70s.%(ext)s",
+    "writethumbnail": True,
+    "merge_output_format": "mp4",
+    "quiet": True,
+    "no_warnings": True,
+    "noplaylist": True,
+    "geo_bypass": True,
+}
 
-SUPPORTED_SITES = [
-    "youtube.com", "youtu.be", "facebook.com", "fb.watch", "tiktok.com",
-    "vimeo.com", "dailymotion.com", "instagram.com", "twitter.com", "x.com",
-    "reddit.com"
-]
+def extract_link(text):
+    for platform, pattern in LINK_PATTERNS.items():
+        match = re.search(pattern, text)
+        if match:
+            return match.group(0), platform
+    return None, None
 
-SUPPORTED_EXTS = [".mp4", ".mkv", ".avi", ".mp3", ".zip", ".pdf", ".rar"]
+@Client.on_message(filters.text & filters.private & ~filters.command)
+async def auto_download_handler(client: Client, message: Message):
+    if temp.IS_PAUSED:
+        return
 
-@app.on_message(filters.private & filters.command("start"))
-async def start_handler(client: Client, message: Message):
-    await message.reply_text(
-        "**Welcome to Smart Downloader Bot!**\n\n"
-        "**Supported Platforms:**\n"
-        "- YouTube, Facebook, TikTok, Instagram, Twitter, Reddit\n"
-        "- Vimeo, Dailymotion, FB Watch\n"
-        "- Direct file links: MP4, MKV, MP3, PDF, ZIP, etc.\n\n"
-        "**How to use:**\n"
-        "Just send a video or file link. No command needed!",
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("Help", callback_data="help")],
-            [InlineKeyboardButton("Join Channel", url="https://t.me/YourChannel")]
-        ])
+    link, platform = extract_link(message.text)
+    if not link:
+        return
+
+    processing = await message.reply_text(f"**Detected {platform.capitalize()} link!**\nProcessing download...")
+
+    try:
+        await download_and_send(client, message, link, platform, processing)
+    except Exception as e:
+        await processing.edit(f"**Error:** `{str(e)}`")
+
+async def download_and_send(client, message, link, platform, processing):
+    opts = YDL_OPTS.copy()
+
+    def progress_hook(d):
+        if d['status'] == 'downloading':
+            downloaded = humanbytes(d.get('downloaded_bytes', 0))
+            total = humanbytes(d.get('total_bytes', d.get('total_bytes_estimate', 0)))
+            speed = humanbytes(d.get('speed', 0))
+            eta = d.get('eta', 0)
+            text = f"**Downloading:** {downloaded} / {total} ({speed}/s) - ETA {eta}s"
+            asyncio.create_task(processing.edit(text))
+
+    opts['progress_hooks'] = [progress_hook]
+
+    with YoutubeDL(opts) as ydl:
+        info = ydl.extract_info(link, download=True)
+        file_path = ydl.prepare_filename(info)
+        if not os.path.exists(file_path):
+            raise Exception("Download failed.")
+
+    await processing.edit("**Uploading...**")
+    caption = f"**{info.get('title', 'Video')}**\nPlatform: `{platform}`"
+    duration = int(info.get("duration", 0))
+
+    await message.reply_video(
+        video=file_path,
+        caption=caption,
+        duration=duration,
+        supports_streaming=True,
+        progress=progress_bar,
+        progress_args=("Uploading...", processing)
     )
+    await processing.delete()
+    os.remove(file_path)
 
-@app.on_callback_query()
-async def callback_handler(client, callback_query):
-    data = callback_query.data
-    if data == "help":
-        await callback_query.message.edit_text(
-            "**Just send any valid video or file link.**\n"
-            "I'll automatically detect it and send the download!"
-        )
+# Initialize the Client
+app = Client("video_downloader_bot", bot_token="YOUR_BOT_TOKEN")
 
-def is_direct_file_link(url: str) -> bool:
-    return url.lower().startswith("http") and any(url.lower().endswith(ext) for ext in SUPPORTED_EXTS)
-
-def is_supported_video_link(url: str) -> bool:
-    return any(site in url.lower() for site in SUPPORTED_SITES)
-
-@app.on_message(filters.private & filters.text & ~filters.command(["start", "help"]))
-async def link_handler(client: Client, message: Message):
-    url = message.text.strip()
-    os.makedirs("downloads", exist_ok=True)
-
-    if is_supported_video_link(url):
-        try:
-            processing = await message.reply_text("Downloading video... Please wait.")
-            ydl_opts = {
-                'format': 'bestvideo+bestaudio/best',
-                'outtmpl': 'downloads/%(title)s.%(ext)s',
-                'quiet': True,
-                'merge_output_format': 'mp4',
-                'nocheckcertificate': True
-            }
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(url, download=True)
-                path = ydl.prepare_filename(info)
-
-            await processing.edit("Uploading video...")
-            await message.reply_video(path, caption=info.get("title", "Here is your video"))
-            os.remove(path)
-        except Exception as e:
-            await message.reply_text("❌ Couldn’t download. Link may be unsupported or private.")
-
-    elif is_direct_file_link(url):
-        try:
-            processing = await message.reply_text("Downloading file... Please wait.")
-            filename = url.split("/")[-1]
-            filepath = f"downloads/{filename}"
-            async with aiohttp.ClientSession() as session:
-                async with session.get(url) as resp:
-                    if resp.status != 200:
-                        return await processing.edit(f"Download failed. HTTP status: {resp.status}")
-                    with open(filepath, 'wb') as f:
-                        while True:
-                            chunk = await resp.content.read(1024)
-                            if not chunk:
-                                break
-                            f.write(chunk)
-
-            await processing.edit("Uploading file...")
-            await message.reply_document(document=filepath, caption="Here is your file.")
-            os.remove(filepath)
-
-        except Exception as e:
-            await message.reply_text(f"❌ File download failed: {e}")
-
-    else:
-        # Only send ONE message if link is invalid
-        await message.reply_text("🚫 Please send a valid video or file link from a supported platform.")
-
-app.run()
+# Run the bot
+if __name__ == "__main__":
+    app.run()
