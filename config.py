@@ -3,7 +3,7 @@ BOT_TOKEN = "YOUR_BOT_TOKEN"
 API_ID = "APP_ID"
 API_HASH = "API_HASH"
 # Temporary flags
-class Temp:
+class temp:
     IS_PAUSED = False
 
 temp = Temp()
