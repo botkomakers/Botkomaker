@@ -1,5 +1,6 @@
 import os
 import aiohttp
+import asyncio
 import yt_dlp
 from pyrogram import Client, filters
 from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
@@ -10,75 +11,64 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "your_bot_token")
 
 app = Client("smart_downloader_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
-# Platforms list to show in /start
-PLATFORM_LIST = """
-**Supported Platforms:**
+SUPPORTED_VIDEO_SITES = [
+    "youtube.com", "youtu.be",
+    "facebook.com", "fb.watch",
+    "tiktok.com",
+    "vimeo.com",
+    "dailymotion.com",
+    "instagram.com", "instagr.am",
+    "twitter.com", "x.com", "mobile.twitter.com",
+    "reddit.com", "bilibili.com",
+    "rumble.com", "linkedin.com", "pinterest.com"
+]
 
-**Video Sites:**
-- YouTube
-- Facebook
-- TikTok
-- Instagram (Reels, Videos)
-- Twitter (X)
-- Vimeo
-- Dailymotion
-- Reddit
-- Bilibili
-- Rumble
-- LinkedIn
-- Pinterest (video pins)
-
-**Audio Sites:**
-- SoundCloud
-- Bandcamp
-- MixCloud
-
-**Other Supported Direct Links:**
-- .mp4, .mkv, .avi, .mp3, .zip, .pdf, .rar, etc.
-
-_Just send a link, and I’ll fetch it!_
-"""
-
-# /start command
+# Start command
 @app.on_message(filters.private & filters.command("start"))
 async def start_handler(client: Client, message: Message):
     await message.reply_text(
         "**Welcome to Smart Downloader Bot!**\n\n"
-        "I can automatically detect and download videos or files from many platforms.\n\n"
-        f"{PLATFORM_LIST}",
+        "**What I can do:**\n"
+        "- Auto-download from YouTube, Facebook, TikTok, Instagram, Twitter, Reddit…\n"
+        "- Handle direct file links (MP4, MKV, ZIP, PDF, etc.)\n"
+        "- Just send any link – no commands needed!\n",
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("Help", callback_data="help")],
             [InlineKeyboardButton("Join Channel", url="https://t.me/YourChannel")]
         ])
     )
 
-# Callback button handling
 @app.on_callback_query()
 async def callback_handler(client, callback_query):
-    data = callback_query.data
-    if data == "help":
+    if callback_query.data == "help":
         await callback_query.message.edit_text(
-            "**Help:**\nJust send me any valid link from supported platforms above.\nI will download and send it to you!"
+            "**Help:**\n"
+            "• Send me any video or file URL (YouTube, Instagram, Twitter, direct .mp4/.zip etc.)\n"
+            "• I’ll download and send it back to you!"
         )
 
-# Direct file detector
 def is_direct_file_link(text):
     return text.lower().startswith("http") and any(
-        text.lower().endswith(ext) for ext in [".mp4", ".mkv", ".avi", ".mp3", ".zip", ".pdf", ".rar"]
+        text.lower().endswith(ext) for ext in [
+            ".mp4", ".mkv", ".avi", ".mov",
+            ".mp3", ".wav",
+            ".zip", ".rar",
+            ".pdf", ".docx", ".xlsx", ".pptx"
+        ]
     )
 
-# Broad video site check — supports all yt-dlp supported domains
 def is_video_link(text):
-    return text.lower().startswith("http")  # Removed strict filtering to allow all yt-dlp supported sites
+    t = text.lower()
+    return t.startswith("http") and any(site in t for site in SUPPORTED_VIDEO_SITES)
 
-# Main auto-download handler
 @app.on_message(filters.private & filters.text & ~filters.command(["start", "help"]))
 async def auto_handler(client: Client, message: Message):
     url = message.text.strip()
     os.makedirs("downloads", exist_ok=True)
 
+    # video-site branch
     if is_video_link(url):
-        msg = await message.reply_text("Downloading video... Please wait.")
+        msg = await message.reply_text("⬇️ Downloading video…")
         try:
             ydl_opts = {
                 'format': 'bestvideo+bestaudio/best',
@@ -87,43 +77,52 @@ async def auto_handler(client: Client, message: Message):
                 'merge_output_format': 'mp4',
                 'noplaylist': True,
             }
-
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 info = ydl.extract_info(url, download=True)
-                video_path = ydl.prepare_filename(info)
+                file_path = ydl.prepare_filename(info)
 
-            await msg.edit("Uploading video...")
-            await message.reply_video(video=video_path, caption=info.get("title", "Here is your video"))
-            os.remove(video_path)
+            await msg.edit("⬆️ Uploading video…")
+            await message.reply_video(video=file_path, caption=info.get("title", "Here’s your video"))
+            os.remove(file_path)
 
         except Exception as e:
-            await msg.edit(f"Video download failed:\n`{str(e)}`")
+            await msg.edit(f"❌ Video download failed:\n`{e}`")
 
+    # direct-file branch
     elif is_direct_file_link(url):
-        msg = await message.reply_text("Downloading file... Please wait.")
-        filename = url.split("/")[-1]
+        msg = await message.reply_text("⬇️ Downloading file…")
+        filename = url.split("/")[-1].split("?")[0]
         filepath = f"downloads/{filename}"
 
         try:
-            async with aiohttp.ClientSession() as session:
+            timeout = aiohttp.ClientTimeout(total=300)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
                 async with session.get(url) as resp:
                     if resp.status != 200:
-                        return await msg.edit(f"Download failed. HTTP status: {resp.status}")
+                        return await msg.edit(f"❌ Download failed. HTTP {resp.status}")
                     with open(filepath, 'wb') as f:
                         while True:
-                            chunk = await resp.content.read(1024)
+                            chunk = await resp.content.read(1024 * 64)
                             if not chunk:
                                 break
                             f.write(chunk)
 
-            await msg.edit("Uploading file...")
-            await message.reply_document(document=filepath, caption="Here is your file.")
+            await msg.edit("⬆️ Uploading file…")
+            lower = filename.lower()
+            if lower.endswith((".mp4", ".mkv", ".avi", ".mov")):
+                await message.reply_video(video=filepath, caption="Here’s your video")
+            elif lower.endswith((".mp3", ".wav")):
+                await message.reply_audio(audio=filepath, caption="Here’s your audio")
+            else:
+                await message.reply_document(document=filepath, caption="Here’s your file")
             os.remove(filepath)
 
+        except asyncio.TimeoutError:
+            await msg.edit("❌ Download timed out.")
         except Exception as e:
-            await msg.edit(f"File download failed:\n`{str(e)}`")
+            await msg.edit(f"❌ File download failed:\n`{e}`")
 
     else:
-        await message.reply_text("Please send a valid video or file link from a supported platform.")
+        await message.reply_text("🚫 Please send a valid video or file link from a supported platform.")
 
 app.run()
